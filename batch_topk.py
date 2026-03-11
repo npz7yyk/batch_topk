@@ -90,7 +90,8 @@ __device__ constexpr unsigned calc_mask(int pass) {
 }
 
 template <typename T>
-__device__ typename cub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_min) {
+__device__ typename cub::Traits<T>::UnsignedBits
+twiddle_in(T key, bool select_min) {
     auto bits = reinterpret_cast<typename cub::Traits<T>::UnsignedBits&>(key);
     bits = cub::Traits<T>::TwiddleIn(bits);
     if (!select_min) bits = ~bits;
@@ -98,9 +99,8 @@ __device__ typename cub::Traits<T>::UnsignedBits twiddle_in(T key, bool select_m
 }
 
 template <typename T>
-__device__ int calc_bucket(T x, int start_bit, unsigned mask, bool select_min) {
-    return (twiddle_in(x, select_min) >> start_bit) & mask;
-}
+__device__ int calc_bucket(T x, int start_bit, unsigned mask, bool select_min)
+{ return (twiddle_in(x, select_min) >> start_bit) & mask; }
 
 inline bool should_use_multiblock(size_t batch_size, size_t max_len) {
     if (max_len <= SEQLEN_THRESHOLD) return false;
@@ -146,7 +146,8 @@ __device__ void filter_and_histogram(
 
         for (int32_t i = threadIdx.x; i < previous_len; i += blockDim.x) {
             const T value = in_buf[i];
-            const auto prev_bits = (twiddle_in(value, select_min) >> prev_start_bit) << prev_start_bit;
+            const auto prev_bits = (twiddle_in(
+                value, select_min) >> prev_start_bit) << prev_start_bit;
             if (prev_bits == kth_value_bits) {
                 int bucket = calc_bucket(value, start_bit, mask, select_min);
                 atomicAdd(&histogram[bucket], 1);
@@ -156,7 +157,8 @@ __device__ void filter_and_histogram(
 }
 
 template <typename T>
-__device__ void choose_bucket(Counter<T>* counter, int32_t* histogram, int32_t k, int pass) {
+__device__ void
+choose_bucket(Counter<T>* counter, int32_t* histogram, int32_t k, int pass) {
     __shared__ int32_t scan[NumBuckets];
     if (threadIdx.x < NumBuckets) scan[threadIdx.x] = histogram[threadIdx.x];
     __syncthreads();
@@ -177,7 +179,9 @@ __device__ void choose_bucket(Counter<T>* counter, int32_t* histogram, int32_t k
             counter->k = k - prev;
             counter->len = cur - prev;
             int start_bit = calc_start_bit<T>(pass);
-            counter->kth_value_bits |= (static_cast<typename cub::Traits<T>::UnsignedBits>(i) << start_bit);
+            counter->kth_value_bits |= (
+                static_cast<typename cub::Traits<T>::UnsignedBits>(i) <<
+                start_bit);
         }
     }
 }
@@ -194,7 +198,8 @@ __device__ void last_filter(
 
     for (int32_t i = threadIdx.x; i < current_len; i += blockDim.x) {
         const T value = in_buf[i];
-        const auto bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
+        const auto bits = (
+            twiddle_in(value, select_min) >> start_bit) << start_bit;
         if (bits < kth_value_bits) {
             int32_t pos = atomicAdd(&counter->out_cnt, 1);
             out_idx[pos] = i;
@@ -240,7 +245,8 @@ __global__ void SingleBlockKernel(
     int32_t buf_len = max_k / 8;
     buf_len = (buf_len / 64) * 64;
     buf_len = buf_len > 256 ? buf_len : 256;
-    int32_t* row_buf = reinterpret_cast<int32_t*>(bufs + batch_id * buf_len * sizeof(int32_t));
+    int32_t* row_buf = reinterpret_cast<int32_t*>(
+        bufs + batch_id * buf_len * sizeof(int32_t));
 
     if (threadIdx.x == 0) {
         counter.k = k;
@@ -258,12 +264,11 @@ __global__ void SingleBlockKernel(
         const int32_t current_len = counter.len;
         const int32_t current_k = counter.k;
 
-        filter_and_histogram(row_in, counter.previous_len,
+        filter_and_histogram(row_in, l_len,
                             &counter, histogram, select_min, pass);
         __syncthreads();
 
         choose_bucket(&counter, histogram, current_k, pass);
-        if (threadIdx.x == 0) counter.previous_len = current_len;
         __syncthreads();
 
         if (counter.len == counter.k || pass == num_passes - 1) {
@@ -302,10 +307,16 @@ __global__ void MultiBlockHistogramKernel(
     const int start_bit = calc_start_bit<T>(pass);
     const unsigned mask = calc_mask<T>(pass);
 
+    // Shared-memory histogram to reduce global atomic contention
+    __shared__ int32_t local_hist[NumBuckets];
+    for (int i = threadIdx.x; i < NumBuckets; i += blockDim.x)
+        local_hist[i] = 0;
+    __syncthreads();
+
     if (pass == 0) {
         for (int32_t i = start + threadIdx.x; i < end; i += blockDim.x) {
             int bucket = calc_bucket(row_in[i], start_bit, mask, select_min);
-            atomicAdd(&row_hist[bucket], 1);
+            atomicAdd(&local_hist[bucket], 1);
         }
     } else {
         const uint32_t kth_val = kth_bits[batch_id];
@@ -316,9 +327,16 @@ __global__ void MultiBlockHistogramKernel(
                 (twiddle_in(value, select_min) >> prev_start) << prev_start);
             if (bits == kth_val) {
                 int bucket = calc_bucket(value, start_bit, mask, select_min);
-                atomicAdd(&row_hist[bucket], 1);
+                atomicAdd(&local_hist[bucket], 1);
             }
         }
+    }
+    __syncthreads();
+
+    // Flush to global with one atomic per non-zero bucket
+    for (int i = threadIdx.x; i < NumBuckets; i += blockDim.x) {
+        if (local_hist[i] > 0)
+            atomicAdd(&row_hist[i], local_hist[i]);
     }
 }
 
@@ -349,7 +367,8 @@ __global__ void MultiBlockChooseBucketKernel(
         int32_t prev = (i == 0) ? 0 : scan[i - 1];
         if (prev < k && scan[i] >= k) {
             remaining_ks[batch_id] = k - prev;
-            kth_bits[batch_id] |= (static_cast<uint32_t>(i) << calc_start_bit<T>(pass));
+            kth_bits[batch_id] |=
+                (static_cast<uint32_t>(i) << calc_start_bit<T>(pass));
         }
     }
 
@@ -445,7 +464,8 @@ void launch_multi_block(
 
     constexpr int num_passes = calc_num_passes<T>();
 
-    int blocks_per_row = (max_len + MIN_ELEMENTS_PER_BLOCK - 1) / MIN_ELEMENTS_PER_BLOCK;
+    int blocks_per_row =
+        (max_len + MIN_ELEMENTS_PER_BLOCK - 1) / MIN_ELEMENTS_PER_BLOCK;
     blocks_per_row = max(blocks_per_row, 1);
     blocks_per_row = min(blocks_per_row, 64);
 
@@ -468,15 +488,18 @@ void launch_multi_block(
         valid_lens, ks, out_idx, batch_size, max_k);
 
     for (int pass = 0; pass < num_passes; ++pass) {
-        MultiBlockHistogramKernel<T><<<batch_size * blocks_per_row, BlockSize, 0, stream>>>(
+        MultiBlockHistogramKernel<T>
+            <<<batch_size * blocks_per_row, BlockSize, 0, stream>>>(
             in_val, valid_lens, histograms, kth_bits,
             batch_size, max_len, blocks_per_row, pass, select_min);
 
-        MultiBlockChooseBucketKernel<T><<<batch_size, BlockSize, 0, stream>>>(
+        MultiBlockChooseBucketKernel<T>
+            <<<batch_size, BlockSize, 0, stream>>>(
             histograms, remaining_ks, kth_bits, batch_size, pass);
     }
 
-    MultiBlockFilterKernel<T><<<batch_size * blocks_per_row, BlockSize, 0, stream>>>(
+    MultiBlockFilterKernel<T>
+        <<<batch_size * blocks_per_row, BlockSize, 0, stream>>>(
         in_val, valid_lens, ks, out_idx, remaining_ks, kth_bits,
         out_cnts, out_back_cnts, batch_size, max_len, max_k,
         blocks_per_row, num_passes - 1, select_min);
@@ -489,16 +512,16 @@ void launch_multi_block(
 // ============================================================================
 
 #define DISPATCH_FLOAT_TYPES(dtype, DType, ...)                               \
-    [&]() {                                                                    \
-        if (dtype == at::ScalarType::Half) {                                   \
-            using DType = __half; return __VA_ARGS__();                        \
-        } else if (dtype == at::ScalarType::BFloat16) {                        \
-            using DType = __nv_bfloat16; return __VA_ARGS__();                 \
-        } else if (dtype == at::ScalarType::Float) {                           \
-            using DType = float; return __VA_ARGS__();                         \
-        } else {                                                               \
-            TORCH_CHECK(false, "Unsupported dtype"); return false;             \
-        }                                                                      \
+    [&]() {                                                                   \
+        if (dtype == at::ScalarType::Half) {                                  \
+            using DType = __half; return __VA_ARGS__();                       \
+        } else if (dtype == at::ScalarType::BFloat16) {                       \
+            using DType = __nv_bfloat16; return __VA_ARGS__();                \
+        } else if (dtype == at::ScalarType::Float) {                          \
+            using DType = float; return __VA_ARGS__();                        \
+        } else {                                                              \
+            TORCH_CHECK(false, "Unsupported dtype"); return false;            \
+        }                                                                     \
     }()
 
 } // namespace batch_topk
@@ -512,7 +535,8 @@ int64_t get_buffer_size(int64_t batch_size, int64_t max_len, int64_t max_k) {
     buf_len = (buf_len / 64) * 64;
     buf_len = buf_len > 256 ? buf_len : 256;
     int64_t single_block_size = batch_size * buf_len * sizeof(int32_t);
-    int64_t multi_block_size = batch_size * (batch_topk::NumBuckets + 5) * sizeof(int32_t) + 256;
+    int64_t multi_block_size =
+        batch_size * (batch_topk::NumBuckets + 5) * sizeof(int32_t) + 256;
     return std::max(single_block_size, multi_block_size);
 }
 
@@ -524,11 +548,18 @@ void launch_batch_topk(
     at::Tensor buf,
     bool select_min) {
 
-    TORCH_CHECK(metric.dim() == 2, "metric must be 2D");
-    TORCH_CHECK(out_idxs.dim() == 2, "out_idxs must be 2D");
-    TORCH_CHECK(metric.is_cuda() && out_idxs.is_cuda(), "tensors must be on CUDA");
-    TORCH_CHECK(metric.is_contiguous() && out_idxs.is_contiguous(), "tensors must be contiguous");
-    TORCH_CHECK(out_idxs.scalar_type() == at::ScalarType::Int, "out_idxs must be int32");
+    TORCH_CHECK(
+        metric.dim() == 2, "metric must be 2D");
+    TORCH_CHECK(
+        out_idxs.dim() == 2, "out_idxs must be 2D");
+    TORCH_CHECK(
+        metric.is_cuda() && out_idxs.is_cuda(), "tensors must be on CUDA");
+    TORCH_CHECK(
+        metric.is_contiguous() && out_idxs.is_contiguous(),
+        "tensors must be contiguous");
+    TORCH_CHECK(
+        out_idxs.scalar_type() == at::ScalarType::Int,
+        "out_idxs must be int32");
 
     const size_t batch_size = metric.size(0);
     const size_t max_len = metric.size(1);
@@ -543,7 +574,8 @@ void launch_batch_topk(
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
     const size_t buf_size = buf.numel() * buf.element_size();
 
-    bool use_multiblock = batch_topk::detail::should_use_multiblock(batch_size, max_len);
+    bool use_multiblock = batch_topk::detail::should_use_multiblock(
+        batch_size, max_len);
 
     DISPATCH_FLOAT_TYPES(metric.scalar_type(), DType, [&] {
         if (use_multiblock) {
